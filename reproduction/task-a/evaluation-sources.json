@@ -1,0 +1,27 @@
+[
+  {
+    "path": "evaluation-tools/evaluation/evaluate.py",
+    "url": "https://raw.githubusercontent.com/cure-lab/PnPInversion/07f97f448150e2ca220bebd54c8f687c5c50c67a/evaluation/evaluate.py",
+    "sha256": "b987ffd3cf9b27aaabdf6adc3e33823b431429a933979b18580d2811a6793fe3"
+  },
+  {
+    "path": "evaluation-tools/evaluation/matrics_calculator.py",
+    "url": "https://raw.githubusercontent.com/cure-lab/PnPInversion/07f97f448150e2ca220bebd54c8f687c5c50c67a/evaluation/matrics_calculator.py",
+    "sha256": "4dee71873d6eadb0ce5eeed22c82ccd2690938c94cea105126ec11cfa5771343"
+  },
+  {
+    "path": "evaluation-cache/torch/hub/facebookresearch_dino_main/hubconf.py",
+    "url": "https://raw.githubusercontent.com/facebookresearch/dino/7c446df5b9f45747937fb0d72314eb9f7b66930a/hubconf.py",
+    "sha256": "fa80babf82c71d2123e23b05061eb1991a1fbc9877238f250b2a25023e910f72"
+  },
+  {
+    "path": "evaluation-cache/torch/hub/facebookresearch_dino_main/vision_transformer.py",
+    "url": "https://raw.githubusercontent.com/facebookresearch/dino/7c446df5b9f45747937fb0d72314eb9f7b66930a/vision_transformer.py",
+    "sha256": "b1f998d5f49ab43666b9fc6d007c5f6540c3ead2e8645e144f74045f63ff44d7"
+  },
+  {
+    "path": "evaluation-cache/torch/hub/facebookresearch_dino_main/utils.py",
+    "url": "https://raw.githubusercontent.com/facebookresearch/dino/7c446df5b9f45747937fb0d72314eb9f7b66930a/utils.py",
+    "sha256": "962a97e1acda1c986dfd921275325e4083f9016dddadcf018f1ccf03fa600eab"
+  }
+]

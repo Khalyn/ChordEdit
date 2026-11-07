@@ -1,0 +1,18 @@
+{
+  "samples": 700,
+  "by_category": {
+    "0": 140,
+    "1": 80,
+    "2": 80,
+    "3": 80,
+    "4": 40,
+    "5": 40,
+    "6": 40,
+    "7": 40,
+    "8": 80,
+    "9": 80
+  },
+  "overlap": 30,
+  "identical_input_hashes": 30,
+  "identical_output_hashes": 30
+}

@@ -1,0 +1,58 @@
+{
+  "PSNR": {
+    "local": 22.63257949129283,
+    "paper": 22.2,
+    "delta": 0.4325794912928309,
+    "valid": 556,
+    "nan": 144,
+    "infinite": 0
+  },
+  "MSE × 1000": {
+    "local": 7.985202752795087,
+    "paper": 6.84,
+    "delta": 1.145202752795087,
+    "valid": 556,
+    "nan": 144,
+    "infinite": 0
+  },
+  "LPIPS × 1000": {
+    "local": 122.63702935323107,
+    "paper": 128.25,
+    "delta": -5.612970646768929,
+    "valid": 556,
+    "nan": 144,
+    "infinite": 0
+  },
+  "CLIP-Whole": {
+    "local": 24.820450487136842,
+    "paper": 25.58,
+    "delta": -0.7595495128631562,
+    "valid": 700,
+    "nan": 0,
+    "infinite": 0
+  },
+  "CLIP-Edited": {
+    "local": 22.134472688947405,
+    "paper": 22.96,
+    "delta": -0.8255273110525962,
+    "valid": 700,
+    "nan": 0,
+    "infinite": 0
+  },
+  "SSIM × 100": {
+    "local": 76.70695873365986,
+    "paper": 75.91,
+    "delta": 0.7969587336598636,
+    "valid": 556,
+    "nan": 144,
+    "infinite": 0
+  },
+  "Structure distance × 1000": {
+    "local": 28.794937722199997,
+    "paper": 16.58,
+    "delta": 12.214937722199998,
+    "valid": 700,
+    "nan": 0,
+    "infinite": 0
+  }
+}
