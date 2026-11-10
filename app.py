@@ -29,6 +29,9 @@ DEFAULT_COMPONENT_PATHS: Dict[str, str] = {
     key: str(Path(DEFAULT_MODEL_ROOT) / subdir) for key, subdir in COMPONENT_SUBDIRS.items()
 }
 
+# ==========================================
+# 更新：清理废弃的潜空间参数，更新默认体验值
+# ==========================================
 DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "noise_samples": 1,
     "n_steps": 1,
@@ -37,21 +40,18 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "t_delta": 0.15,
     "step_scale": 1.0,
     "cleanup": True,
-    "use_local_chord": False,
+    "use_local_chord": True,  # 默认开启背景保护
     "local_mode": "B",
-    "local_beta": 0.2,
+    "local_beta": 0.1,
     "mask_tau_low": 0.1,
     "mask_tau_high": 0.4,
     "mask_sigma": 2.0,
-    "use_adaptive_delta": False,
-    "adaptive_alpha": 1.0,
+    "use_adaptive_delta": True,  # 默认开启时间自适应
+    "adaptive_alpha": 0.5,
     "adaptive_floor": 0.2,
-    # ---- 清晰度增强模块 ----
-    "use_sharpen_u": False,
+    # ---- 清晰度增强模块（像素空间） ----
+    "use_sharpen_u": True,  # 默认开启像素空间锐化
     "sharpen_gamma": 0.5,
-    "use_latent_sharp": False,
-    "latent_sharp_bg": 0.5,
-    "latent_sharp_fg": 0.2,
 }
 
 DEFAULT_SEED = 42
@@ -112,9 +112,9 @@ def _mask_tensor_to_pil(mask_tensor: torch.Tensor, size: int = 512) -> Image.Ima
 
 
 def _overlay_mask_on_source(
-    source: Optional[Image.Image],
-    mask_pil: Image.Image,
-    alpha: float = 0.55,
+        source: Optional[Image.Image],
+        mask_pil: Image.Image,
+        alpha: float = 0.55,
 ) -> Optional[Image.Image]:
     """Red-tint the source image by the mask; center-crops like the pipeline."""
     if source is None:
@@ -230,8 +230,8 @@ def load_examples(dataset_root: Path, max_examples: Optional[int]) -> List[List[
 
 
 def _validate_inputs(
-    image: Optional[Image.Image], source_prompt: str, target_prompt: str,
-    t_start: float, t_end: float, t_delta: float,
+        image: Optional[Image.Image], source_prompt: str, target_prompt: str,
+        t_start: float, t_end: float, t_delta: float,
 ) -> None:
     if image is None:
         raise gr.Error("Please upload a source image first.")
@@ -249,18 +249,22 @@ def _validate_inputs(
 # Demo builder
 # ---------------------------------------------------------------------------
 def build_demo(
-    pipeline: ChordEditPipeline,
-    default_seed: int,
-    default_edit_config: Dict[str, Any],
-    examples: List[List[Any]],
+        pipeline: ChordEditPipeline,
+        default_seed: int,
+        default_edit_config: Dict[str, Any],
+        examples: List[List[Any]],
 ) -> gr.Blocks:
+    # ==========================================
+    # 更新：清理废弃参数的函数签名
+    # ==========================================
     def run_edit(
-        image: Optional[Image.Image],
-        source_prompt: str, target_prompt: str,
-        seed: float, n_samples: float,
-        t_start: float, t_end: float, t_delta: float, step_scale: float,
-        use_local_chord, local_beta, mask_tau_low, mask_tau_high, mask_sigma,
-        use_adaptive_delta, adaptive_alpha, adaptive_floor,use_sharpen_u, sharpen_gamma, use_latent_sharp, latent_sharp_bg, latent_sharp_fg,
+            image: Optional[Image.Image],
+            source_prompt: str, target_prompt: str,
+            seed: float, n_samples: float,
+            t_start: float, t_end: float, t_delta: float, step_scale: float,
+            use_local_chord, local_beta, mask_tau_low, mask_tau_high, mask_sigma,
+            use_adaptive_delta, adaptive_alpha, adaptive_floor,
+            use_sharpen_u, sharpen_gamma,
     ):
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
 
@@ -281,12 +285,9 @@ def build_demo(
             "use_adaptive_delta": bool(use_adaptive_delta),
             "adaptive_alpha": float(adaptive_alpha),
             "adaptive_floor": float(adaptive_floor),
-            # ---- 清晰度增强模块 ----
+            # ---- 清晰度增强模块（像素空间） ----
             "use_sharpen_u": bool(use_sharpen_u),
             "sharpen_gamma": float(sharpen_gamma),
-            "use_latent_sharp": bool(use_latent_sharp),
-            "latent_sharp_bg": float(latent_sharp_bg),
-            "latent_sharp_fg": float(latent_sharp_fg),
         }
 
         try:
@@ -325,7 +326,7 @@ def build_demo(
             elem_classes=["panel-note"],
         )
 
-        # ---------------- 参数调整指南（对应论文图 17 / 图 8） ----------------
+        # ---------------- 更新：参数调整指南 ----------------
         with gr.Accordion("📖 参数调整指南", open=False, elem_classes=["param-guide"]):
             gr.Markdown(
                 """
@@ -339,34 +340,30 @@ def build_demo(
 | `step_scale` (λ) | 编辑更强，可能过编辑/伪影 | 编辑不足 | 0.8–1.2 | 论文默认 1.0 |
 | `n_samples` | 方向估计方差↓，**显存/耗时线性↑** | 快但方向更抖 | 1–4 | `N*4*B` 决定 UNet 前向 batch |
 
-**空间自适应（`use_local_chord`）**
+**空间自适应（`use_local_chord`）- 像素空间背景保护**
 
 | 参数 | 往 **大** 调 | 往 **小** 调 | 推荐 |
 |---|---|---|---|
-| `local_beta` (β) | 趋近原版（`1.0` = 完全关闭） | 背景更冻结，**`0` 易在边界出现接缝/贴图感** | 0.1–0.3 |
-| `mask_sigma` (σ) | 边界更平滑，**过大缩编辑区** | `0` = 硬 mask，接缝明显 | 1.5–2.5 |
-| `mask_tau_low` | mask 收缩，可能**漏掉弱语义编辑区** | mask 扩大，背景也变 | 0.05–0.20 |
-| `mask_tau_high` | **编辑区被削弱**（CLIP-Edited↓） | mask 更满，接近原版 | 0.30–0.60 |
+| `local_beta` (β) | 趋近原版（`1.0` = 完全关闭） | 背景更冻结，`0` 完全使用原图像素 | 0.05–0.3 |
+| `mask_sigma` (σ) | 边界更平滑（大半径高斯羽化），**过大缩编辑区** | 边缘锐利，`0` 可能产生接缝 | 1.0–2.5 |
+| `mask_tau_low` | mask 收缩，可能**漏掉弱语义编辑区** | mask 扩大，背景也会跟着生成图改变 | 0.1–0.3 |
+| `mask_tau_high` | **编辑区被削弱**（CLIP-Edited↓） | mask 更满，接近原版 | 0.3–0.6 |
 
-**时间自适应（`use_adaptive_delta`）**
+**时间自适应（`use_adaptive_delta`）- 全局标量带宽**
 
 | 参数 | 往 **大** 调 | 往 **小** 调 | 推荐 |
 |---|---|---|---|
-| `adaptive_alpha` (α) | 能量调制更强、更激进；**`0` 精确等价原版** | 退化为固定 δ | 0.5–0.75 |
-| `adaptive_floor` | 背景 δ 更大，更接近原版（更稳） | **`0` 时背景融合几乎全取 `dv_s0`，易抖动** | 0.20–0.40 |
+| `adaptive_alpha` (α) | 能量调制更强、更激进；**`0` 精确等价原版** | 退化为固定 δ | 0.3–0.8 |
+| `adaptive_floor` | 背景 δ 更大，更接近原版（更稳） | `0` 时背景融合几乎全取 `dv_s0`，易抖动 | 0.2–0.4 |
+
+#### 🛠 清晰度增强模块（Pixel-Space Enhancement）
+
+| 参数 | 原理与效果 | 推荐范围 |
+|---|---|---|
+| **`use_sharpen_u`** | **像素空间锐化**。对最终输出图做 UnsharpMask，极大提升边缘和纹理清晰度，修复 VAE 解码造成的模糊。 | 开启 |
+| `sharpen_gamma` | 锐化强度。↑ 图像细节更锐，但太高可能导致噪点或边缘光晕。 | 0.3 – 0.8 |
 
 > 提示：mask 面板为空说明当前 `use_local_chord=False`，属正常情况。
-
-#### 🛠 清晰度增强模块（High-Frequency Enhancement）
-
-| 参数 | 原理与效果 | 推荐范围 | 论文解释 |
-|---|---|---|---|
-| **`use_sharpen_u`** | **路线一：控制场锐化**。对提取出的编辑方向 `û` 做反锐化掩蔽。让编辑边界更清晰，不拖泥带水。 | 开启 | 在 Transport 阶段干预能量场，增加高频。 |
-| `sharpen_gamma` | 锐化强度。↑ 边缘更锐，但太高会导致边缘出现光晕（Halos）。 | 0.3 – 0.8 | Unsharp masking 的增益系数。 |
-| **`use_latent_sharp`** | **路线二：潜空间高频回填**。由于 VAE 解码必定丢失高频，该操作在 VAE 解码前，把原图的纹理高频“塞回”背景，同时给前景提锐。 | 开启 | 解决单步编辑和 VAE 重建导致的“发糊”问题。 |
-| `latent_sharp_bg` | 背景清晰度回填力度。↑ 背景树叶/发丝等纹理越清晰（越接近原图）；↓ 背景可能会显得像被磨皮过一样。 | 0.3 – 0.7 | 用原图高频 `hf_src` 修补背景。 |
-| `latent_sharp_fg` | 前景（编辑区）细节强化。↑ 胡子/衣服纹理更锐利；↓ 更柔和。**注意：太高容易导致噪点或过曝。** | 0.1 – 0.3 | 用生成图高频 `hf_curr` 提锐前景。 |
-
                 """
             )
 
@@ -432,89 +429,72 @@ def build_demo(
 
                 use_local_chord = gr.Checkbox(
                     label="Use Local Chord (Energy-Mask Localization)",
-                    value=False,
-                    info="关闭 = 原版 ChordEdit 基线；开启 = 用控制场能量导出 soft mask：编辑区强传输、背景弱传输，prox 前后双重背景锚定。NFE 不变。",
+                    value=True,  # 默认开启
+                    info="关闭 = 原版 ChordEdit 基线；开启 = 在像素空间将背景完美替换回原图。",
                 )
                 with gr.Accordion("Local Chord Parameters", open=False):
                     with gr.Row():
                         local_beta_input = gr.Slider(
-                            label="local_beta (β, 背景 transport 衰减)",
+                            label="local_beta (β, 背景保留比例)",
                             minimum=0.0, maximum=1.0, step=0.05,
-                            value=float(default_edit_config.get("local_beta", 0.2)),
-                            info="1.0 = 退化为原版；0 = 背景完全冻结（可能边界接缝/贴图感）；推荐 0.1–0.3，保留轻微背景响应更自然。",
+                            value=float(default_edit_config.get("local_beta", 0.1)),
+                            info="1.0 = 退化为原版；0 = 背景完全冻结；推荐 0.05–0.3，保留轻微背景响应更自然。",
                         )
                         mask_sigma_input = gr.Slider(
                             label="mask_sigma (σ, 高斯羽化)",
                             minimum=0.0, maximum=4.0, step=0.1,
                             value=float(default_edit_config.get("mask_sigma", 2.0)),
-                            info="0 = 硬 mask（有接缝）；2 ≈ 平滑过渡；>4 过度模糊会缩小编辑区。推荐 1.5–2.5。",
+                            info="0 = 硬 mask（有接缝）；2 ≈ 平滑过渡；>4 过度模糊会缩小编辑区。推荐 1.0–2.5。",
                         )
                     with gr.Row():
                         mask_tau_low_input = gr.Slider(
                             label="mask_tau_low (soft mask 下阈值)",
                             minimum=0.0, maximum=1.0, step=0.01,
                             value=float(default_edit_config.get("mask_tau_low", 0.1)),
-                            info="↑ mask 收缩、只保留强编辑区域（可能漏掉弱语义）；↓ mask 扩大、背景也变。推荐 0.05–0.20。",
+                            info="↑ mask 收缩、只保留强编辑区域（可能漏掉弱语义）；↓ mask 扩大、背景也变。推荐 0.1–0.3。",
                         )
                         mask_tau_high_input = gr.Slider(
                             label="mask_tau_high (soft mask 上阈值)",
                             minimum=0.0, maximum=2.0, step=0.01,
                             value=float(default_edit_config.get("mask_tau_high", 0.4)),
-                            info="↑ 编辑区可能也被削弱（CLIP-Edited↓）；↓ mask 更满、接近原版。推荐 0.30–0.60。",
+                            info="↑ 编辑区可能也被削弱（CLIP-Edited↓）；↓ mask 更满、接近原版。推荐 0.3–0.6。",
                         )
 
                 use_adaptive_delta = gr.Checkbox(
                     label="Use Adaptive Delta (Energy-Driven Time Bandwidth)",
-                    value=False,
-                    info="关闭 = 固定 δ；开启 = 用 dv_s0 逐位置能量调制 δ：编辑区信任噪声端（激进）、背景信任干净端（保守）。α=0 时精确退化为原版。",
+                    value=True,  # 默认开启
+                    info="关闭 = 固定 δ；开启 = 用全局能量自适应调制 δ。α=0 时精确退化为原版。",
                 )
                 with gr.Accordion("Adaptive Delta Parameters", open=False):
                     with gr.Row():
                         adaptive_alpha_input = gr.Slider(
                             label="adaptive_alpha (α, 能量调制强度)",
                             minimum=0.0, maximum=1.0, step=0.05,
-                            value=float(default_edit_config.get("adaptive_alpha", 1.0)),
-                            info="0 = 精确退化为固定 δ（用于等价性验证）；1 = 完全能量驱动，较激进。推荐 0.5–0.75。",
+                            value=float(default_edit_config.get("adaptive_alpha", 0.5)),
+                            info="0 = 精确退化为固定 δ；1 = 完全能量驱动，较激进。推荐 0.5–0.75。",
                         )
                         adaptive_floor_input = gr.Slider(
                             label="adaptive_floor (背景最小 δ 比例)",
                             minimum=0.0, maximum=1.0, step=0.05,
                             value=float(default_edit_config.get("adaptive_floor", 0.2)),
-                            info="0 时背景 δ→0，融合几乎全取 dv_s0，而背景 dv_s0 是噪声 → 易抖动；推荐 0.20–0.40 保留最小噪声端信息。",
+                            info="0 时背景 δ→0，融合几乎全取 dv_s0，易抖动；推荐 0.20–0.40 保留最小噪声端信息。",
                         )
-                # ---------------- 清晰度增强 ----------------
+
+                # ---------------- 更新：清晰度增强（已彻底移除潜空间参数） ----------------
                 use_sharpen_u = gr.Checkbox(
-                    label="1. Sharpen Control Field (u_hat High-Freq)",
-                    value=False,
-                    info="锐化编辑方向场，修复边缘模糊（零 NFE）。",
+                    label="1. Sharpen Result (Pixel-Space Unsharp Mask)",
+                    value=True,  # 默认开启
+                    info="在像素空间对最终结果进行锐化，极大提升清晰度（零 NFE）。",
                 )
                 with gr.Accordion("Control Field Sharpen Parameters", open=False):
                     sharpen_gamma_input = gr.Slider(
-                        label="sharpen_gamma (边缘锐化强度)",
+                        label="sharpen_gamma (锐化强度)",
                         minimum=0.0, maximum=2.0, step=0.1,
                         value=float(default_edit_config.get("sharpen_gamma", 0.5)),
-                        info="↑ 边缘更锐利但可能出现伪影；↓ 边缘较平滑。推荐 0.3–0.8。",
+                        info="↑ 边缘更锐利但可能出现光晕；↓ 边缘较平滑。推荐 0.3–0.8。",
                     )
+                # --------------------------------------------------------------------------------
 
-                use_latent_sharp = gr.Checkbox(
-                    label="2. Latent HF Compensation (Background Clarity)",
-                    value=False,
-                    info="在解码前注入原图高频，修复背景/纹理发糊（零 NFE）。",
-                )
-                with gr.Accordion("Latent HF Compensation Parameters", open=False):
-                    with gr.Row():
-                        latent_sharp_bg_input = gr.Slider(
-                            label="latent_sharp_bg (背景清晰度回填)",
-                            minimum=0.0, maximum=1.0, step=0.05,
-                            value=float(default_edit_config.get("latent_sharp_bg", 0.5)),
-                            info="↑ 背景越接近源图原生清晰度；↓ 背景更平滑（可能会糊）。推荐 0.3–0.7。",
-                        )
-                        latent_sharp_fg_input = gr.Slider(
-                            label="latent_sharp_fg (前景细节强化)",
-                            minimum=0.0, maximum=1.0, step=0.05,
-                            value=float(default_edit_config.get("latent_sharp_fg", 0.2)),
-                            info="↑ 生成的编辑对象细节更锐利；↓ 更柔和。推荐 0.1–0.3，太高容易过曝。",
-                        )
                 run_button = gr.Button("Run Edit", variant="primary")
 
             # ---------------- 右栏：结果 + mask 可视化（Tabs） ----------------
@@ -539,6 +519,7 @@ def build_demo(
                             height=250,
                         )
 
+        # 更新：同步清理输入列表
         run_inputs = [
             input_image, source_prompt, target_prompt,
             seed_input, n_samples_input,
@@ -547,7 +528,6 @@ def build_demo(
             mask_tau_low_input, mask_tau_high_input, mask_sigma_input,
             use_adaptive_delta, adaptive_alpha_input, adaptive_floor_input,
             use_sharpen_u, sharpen_gamma_input,
-            use_latent_sharp, latent_sharp_bg_input, latent_sharp_fg_input,
         ]
         run_outputs = [output_image, mask_output, overlay_output]
 
@@ -572,11 +552,7 @@ def build_demo(
             inputs=use_sharpen_u,
             outputs=sharpen_gamma_input,
         )
-        use_latent_sharp.change(
-            fn=lambda v: [gr.update(interactive=bool(v)) for _ in [latent_sharp_bg_input, latent_sharp_fg_input]],
-            inputs=use_latent_sharp,
-            outputs=[latent_sharp_bg_input, latent_sharp_fg_input],
-        )
+
         if examples:
             gr.Markdown("## Examples")
             gr.Examples(

@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+import torch.nn.functional as F
+from PIL import Image, ImageOps, ImageFilter
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -14,7 +15,7 @@ from diffusers.utils import BaseOutput
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPTextModel
-import torch.nn.functional as F
+
 DEFAULT_SEED = 42
 DEFAULT_COMPUTE_DTYPE = torch.float32
 DEFAULT_SAFETY_CHECKER_ID = "CompVis/stable-diffusion-safety-checker"
@@ -25,14 +26,11 @@ LOGGER = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Pipeline output container
 # ---------------------------------------------------------------------------
-
-
 @dataclass
 class ChordEditPipelineOutput(BaseOutput):
     images: List[Image.Image] | torch.Tensor
     latents: torch.Tensor
     masks: Optional[torch.Tensor] = None  # ← 新增，仅 return_mask=True 时非 None
-
 
 
 class _CenterSquareCropTransform:
@@ -61,26 +59,24 @@ class _CenterSquareCropTransform:
 # ---------------------------------------------------------------------------
 # ChordEdit Pipeline
 # ---------------------------------------------------------------------------
-
-
 class ChordEditPipeline(DiffusionPipeline):
     """Standalone pipeline that wires up diffusers modules with the Chord editor."""
 
     def __init__(
-        self,
-        unet: UNet2DConditionModel,
-        scheduler: DDPMScheduler,
-        vae: AutoencoderKL,
-        tokenizer,
-        text_encoder: CLIPTextModel,
-        default_edit_config: Optional[Dict[str, Any]] = None,
-        image_size: int = 512,
-        device: Optional[str | torch.device] = None,
-        compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
-        use_attention_mask: bool = False,
-        use_center_crop: bool = True,
-        use_safety_checker: bool = False,
-        safety_checker_id: Optional[str] = DEFAULT_SAFETY_CHECKER_ID,
+            self,
+            unet: UNet2DConditionModel,
+            scheduler: DDPMScheduler,
+            vae: AutoencoderKL,
+            tokenizer,
+            text_encoder: CLIPTextModel,
+            default_edit_config: Optional[Dict[str, Any]] = None,
+            image_size: int = 512,
+            device: Optional[str | torch.device] = None,
+            compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
+            use_attention_mask: bool = False,
+            use_center_crop: bool = True,
+            use_safety_checker: bool = False,
+            safety_checker_id: Optional[str] = DEFAULT_SAFETY_CHECKER_ID,
     ) -> None:
         super().__init__()
         self.register_modules(
@@ -118,6 +114,7 @@ class ChordEditPipeline(DiffusionPipeline):
         for module in modules:
             if module is not None:
                 module.to(device=self._device, dtype=self._compute_dtype)
+
     def _init_safety_checker(self) -> None:
         if not self._safety_checker_id:
             LOGGER.warning("Safety checker requested but no identifier provided; disabling safety checks.")
@@ -140,18 +137,18 @@ class ChordEditPipeline(DiffusionPipeline):
     # ------------------------------------------------------------------ #
     @classmethod
     def from_local_weights(
-        cls,
-        component_paths: Dict[str, str],
-        *,
-        default_edit_config: Optional[Dict[str, Any]] = None,
-        device: Optional[str | torch.device] = None,
-        torch_dtype: torch.dtype = torch.float32,
-        image_size: int = 512,
-        use_center_crop: bool = True,
-        compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
-        use_attention_mask: bool = False,
-        use_safety_checker: bool = False,
-        safety_checker_id: Optional[str] = DEFAULT_SAFETY_CHECKER_ID,
+            cls,
+            component_paths: Dict[str, str],
+            *,
+            default_edit_config: Optional[Dict[str, Any]] = None,
+            device: Optional[str | torch.device] = None,
+            torch_dtype: torch.dtype = torch.float32,
+            image_size: int = 512,
+            use_center_crop: bool = True,
+            compute_dtype: torch.dtype = DEFAULT_COMPUTE_DTYPE,
+            use_attention_mask: bool = False,
+            use_safety_checker: bool = False,
+            safety_checker_id: Optional[str] = DEFAULT_SAFETY_CHECKER_ID,
     ) -> "ChordEditPipeline":
         """Instantiate the pipeline from individual component checkpoints."""
 
@@ -187,15 +184,15 @@ class ChordEditPipeline(DiffusionPipeline):
     # ------------------------------------------------------------------ #
     @torch.no_grad()
     def __call__(
-        self,
-        image: Image.Image | torch.Tensor,
-        *,
-        source_prompt: str,
-        target_prompt: str,
-        edit_config: Optional[Dict[str, Any]] = None,
-        seed: Optional[int] = None,
-        output_type: str = "pil",
-        return_mask: bool = False,
+            self,
+            image: Image.Image | torch.Tensor,
+            *,
+            source_prompt: str,
+            target_prompt: str,
+            edit_config: Optional[Dict[str, Any]] = None,
+            seed: Optional[int] = None,
+            output_type: str = "pil",
+            return_mask: bool = False,
     ) -> ChordEditPipelineOutput:
         """Run ChordEdit once on a single image."""
 
@@ -234,6 +231,7 @@ class ChordEditPipeline(DiffusionPipeline):
 
         decoded = self._decode_latent_to_image(x0_pred)
         decoded, _ = self._apply_safety_checker(decoded)
+
         output_latents.append(x0_pred.detach().cpu())
         decoded_batches.append(decoded.detach().cpu())
 
@@ -241,6 +239,48 @@ class ChordEditPipeline(DiffusionPipeline):
         latents_tensor = torch.cat(output_latents, dim=0)
         images = self._tensor_to_pil(images_tensor) if output_type == "pil" else images_tensor
 
+        # =======================================================
+        # 创新点操作：全部转移到 512x512 像素空间进行
+        # =======================================================
+        if isinstance(images, list):
+            # 1. 像素空间的背景保护 (Spatial Background Anchoring)
+            if edit_params.get("use_local_chord", False) and final_mask is not None:
+                # 【修复】完全使用经过中心裁剪和对齐的 pixel_values 还原背景
+                src_tensor = pixel_values[0].cpu().float()
+                src_tensor = (src_tensor * 0.5 + 0.5).clamp(0.0, 1.0)  # [-1, 1] -> [0, 1]
+                src_pil = transforms.ToPILImage()(src_tensor)
+
+                # 把潜空间的 mask 放大到 512x512，并做羽化，防止接缝 (半径3即可，8太糊了)
+                mask_pil = Image.fromarray((final_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)).resize(
+                    images[0].size, Image.BILINEAR
+                )
+                mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=3))
+                mask_np = np.array(mask_pil).astype(np.float32) / 255.0
+                mask_np = mask_np[..., None]  # (H, W, 1)
+
+                beta = edit_params.get("local_beta", 0.0)
+                mask_weight = mask_np + (1.0 - mask_np) * beta
+
+                gen_np = np.array(images[0]).astype(np.float32)
+                src_np = np.array(src_pil).astype(np.float32)
+
+                mixed = gen_np * mask_weight + src_np * (1.0 - mask_weight)
+                images = [Image.fromarray(mixed.astype(np.uint8))]
+
+            # 2. 像素空间的高频清晰度增强
+            if edit_params.get("use_sharpen_u", False):
+                sharpened_images = []
+                percent = int(edit_params.get("sharpen_gamma", 0.5) * 100)
+                if percent > 0:
+                    for img in images:
+                        sharpened = img.filter(ImageFilter.UnsharpMask(
+                            radius=2.0,
+                            percent=percent,
+                            threshold=3
+                        ))
+                        sharpened_images.append(sharpened)
+                    images = sharpened_images
+        # =======================================================
         return ChordEditPipelineOutput(
             images=images,
             latents=latents_tensor,
@@ -276,7 +316,7 @@ class ChordEditPipeline(DiffusionPipeline):
                 side = min(height, width)
                 top = (height - side) // 2
                 left = (width - side) // 2
-                vae_tensor = vae_tensor[:, :, top : top + side, left : left + side]
+                vae_tensor = vae_tensor[:, :, top: top + side, left: left + side]
         return vae_tensor.to(device=self._device, dtype=self._compute_dtype)
 
     def _encode_image_to_latent(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -296,10 +336,10 @@ class ChordEditPipeline(DiffusionPipeline):
     def _apply_safety_checker(self, images: torch.Tensor) -> tuple[torch.Tensor, List[bool]]:
         batch = images.shape[0]
         if (
-            not self._use_safety_checker
-            or self._safety_checker is None
-            or self._safety_feature_extractor is None
-            or batch == 0
+                not self._use_safety_checker
+                or self._safety_checker is None
+                or self._safety_feature_extractor is None
+                or batch == 0
         ):
             return images, [False] * batch
 
@@ -418,10 +458,10 @@ class ChordEditPipeline(DiffusionPipeline):
         return params
 
     def _prepare_noise_list(
-        self,
-        latents: torch.Tensor,
-        seed_value: int,
-        num_noises: int,
+            self,
+            latents: torch.Tensor,
+            seed_value: int,
+            num_noises: int,
     ) -> List[torch.Tensor]:
         torch.manual_seed(seed_value)
         if torch.cuda.is_available():
@@ -486,7 +526,6 @@ class ChordEditPipeline(DiffusionPipeline):
         mask = self._gaussian_blur(mask, sigma=sigma)
         return mask
 
-
     def _time_to_index(self, batch: int, t_scalar: float, device, dtype=torch.long):
         idx = round(self._max_unet_timestep * float(t_scalar))
         idx = max(0, min(self._max_unet_timestep, idx))
@@ -514,7 +553,7 @@ class ChordEditPipeline(DiffusionPipeline):
         x0_pred = (z_t - sigma_t * noise_pred) / alpha_t
         return x0_pred
 
-    def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float,adaptive_cfg ):
+    def _u_estimate(self, x_anchor, src_embed, edit_embed, noise, t_s: float, delta: float, adaptive_cfg):
         batch, device = x_anchor.shape[0], x_anchor.device
         t_idx_s = self._time_to_index(batch, t_s, device=device)
         t_idx_s0 = self._time_to_index(batch, max(0.0, t_s - delta), device=device)
@@ -575,28 +614,19 @@ class ChordEditPipeline(DiffusionPipeline):
                 return dv_s
             return (delta * dv_s + t_s * dv_s0) / denom
 
-        # ---- 时间自适应：逐位置有效 δ ----
+        # === 【重构版：时间自适应】基于全局能量计算标量 delta ===
         alpha = float(adaptive_cfg.get("alpha", 1.0))
         floor = float(adaptive_cfg.get("floor", 0.2))
-        eps = torch.finfo(dv_s.dtype).eps
 
-        # 复用 _energy_mask 的归一化：tau_low=0, tau_high=1, sigma=0 时
-        # 返回 clip(E/E_99, 0, 1)，正是所需的 E_norm ∈ [0,1]
-        E_norm = self._energy_mask(
-            dv_s0, tau_low=0.0, tau_high=1.0, sigma=0.0,
-            gamma=1.0,    # <--- 1.0，取消增益
-            dilate=0,     # <--- 0.0，取消膨胀
-        )  # (B,1,H,W)
+        mean_energy = (dv_s0 ** 2).mean().item()
+        threshold = 0.1
+        scale = threshold / (mean_energy + 1e-6)
+        energy_factor = torch.tanh(torch.tensor(scale - 1.0)).item()
 
-        E_mixed = floor + (1.0 - floor) * E_norm  # (B,1,H,W) ∈ [floor, 1]
-        delta_eff = delta * ((1.0 - alpha) + alpha * E_mixed)  # (B,1,H,W) ∈ [δ·(1-α), δ]
+        delta_eff = delta * ((1.0 - alpha) + alpha * (floor + (1.0 - floor) * (0.5 + 0.5 * energy_factor)))
+        delta_eff = max(0.0, min(t_s - 1e-6, delta_eff))
 
-        # 防御：确保 δ_eff < t_s（理论上已满足，兜底防浮点误差）
-        max_delta = max(t_s - 1e-6, 0.0)
-        delta_eff = delta_eff.clamp(min=0.0, max=max_delta)
-
-        denom = (t_s + delta_eff).clamp_min(eps)  # (B,1,H,W)
-        return (delta_eff * dv_s + t_s * dv_s0) / denom
+        return (delta_eff * dv_s + t_s * dv_s0) / (t_s + delta_eff)
 
     def _run_edit(
             self,
@@ -616,44 +646,31 @@ class ChordEditPipeline(DiffusionPipeline):
             ).tolist()
 
         use_local = params["use_local_chord"]
-        mode = params["local_mode"]
         beta = params["local_beta"]
         tau_lo = params["mask_tau_low"]
         tau_hi = params["mask_tau_high"]
         sigma = params["mask_sigma"]
-        # 新增背景清晰参数解包
-        use_sharpen_u = params.get("use_sharpen_u", False)
-        sharpen_gamma = params.get("sharpen_gamma", 0.5)
 
         x_curr = x_src
         last_mask: Optional[torch.Tensor] = None
         adaptive_cfg = None
+
+        # 修复：清理重复的 adaptive_cfg 判断
         if params["use_adaptive_delta"]:
             adaptive_cfg = {
                 "enable": True,
                 "alpha": params["adaptive_alpha"],
                 "floor": params["adaptive_floor"],
             }
-        adaptive_cfg = None
-        if params["use_adaptive_delta"]:
-            adaptive_cfg = {
-                "enable": True,
-                "alpha": params["adaptive_alpha"],
-                "floor": params["adaptive_floor"],
-            }
+
         for t_s in t_grid:
+            # 1. 获取方向 (包含全局时间自适应)
             u_hat = self._u_estimate(
                 x_curr, src_embed, edit_embed, noise,
-                float(t_s), params["t_delta"],adaptive_cfg=adaptive_cfg,
-
+                float(t_s), params["t_delta"], adaptive_cfg=adaptive_cfg,
             )
-            # 路线一：控制场高频锐化 (Unsharp Masking)
-            if use_sharpen_u:
-                # 提取 u_hat 的高频（u_hat - 模糊）
-                # 注意：_gaussian_blur 支持多通道输入
-                hf_u = u_hat - self._gaussian_blur(u_hat, sigma=1.0)
-                u_hat = u_hat + sharpen_gamma * hf_u
 
+            # 2. Transport 更新
             if use_local:
                 mask = self._energy_mask(u_hat, tau_lo, tau_hi, sigma)  # (B,1,H,W)
                 last_mask = mask
@@ -666,34 +683,17 @@ class ChordEditPipeline(DiffusionPipeline):
             else:
                 x_curr = x_curr + params["step_scale"] * u_hat
 
-
+        # 3. Cleanup 阶段（恢复潜空间背景锚定）
         if params["cleanup"]:
-            t_end_idx = self._time_to_index(
-                x_src.shape[0], params["t_end"], device=device
-            )
+            t_end_idx = self._time_to_index(x_src.shape[0], params["t_end"], device=device)
+
             if use_local and last_mask is not None:
-                if mode == "B":
-                    # 背景锚定 → prox → 后混合
-                    x_pred_reg = last_mask * x_curr + (1.0 - last_mask) * x_src
-                    x_prox = self._pred_x0(x_pred_reg, t_end_idx, edit_embed, noise[0])
-                    x_curr = last_mask * x_prox + (1.0 - last_mask) * x_src
-                else:  # mode == "A"
-                    x_prox = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
-                    x_curr = last_mask * x_prox + (1.0 - last_mask) * x_src
+                # 在潜空间里，把背景拉回原图，让 Prox 看到的背景是原图
+                x_pred_reg = last_mask * x_curr + (1.0 - last_mask) * x_src
+                x_prox = self._pred_x0(x_pred_reg, t_end_idx, edit_embed, noise[0])
+                # 输出潜空间再次锚定，防止背景微变
+                x_curr = last_mask * x_prox + (1.0 - last_mask) * x_src
             else:
                 x_curr = self._pred_x0(x_curr, t_end_idx, edit_embed, noise[0])
-
-        # 路线二：潜空间高频回填 (Latent HF Compensation)
-        if params.get("use_latent_sharp", False):
-            hf_curr = x_curr - self._gaussian_blur(x_curr, sigma=1.2)
-            hf_src = x_src - self._gaussian_blur(x_src, sigma=1.2)
-
-            if use_local and last_mask is not None:
-                # 背景把源图的高频补回来，前景做适当提锐
-                x_curr = x_curr + (1.0 - last_mask) * hf_src * params["latent_sharp_bg"]
-                x_curr = x_curr + last_mask * hf_curr * params["latent_sharp_fg"]
-            else:
-                # 如果关闭了局部 Mask，就只做整体提锐
-                x_curr = x_curr + hf_curr * params["latent_sharp_fg"]
 
         return x_curr, last_mask
