@@ -67,7 +67,7 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "alpha_remap_width": 0.30,
     "pixel_beta": 0.0,
     # ---- 对照基线（不属于本文方法）----
-    "use_sharpen_u": True,  # 团队既有模块，保持上游默认
+    "use_sharpen_u": True,  # 默认开启像素空间锐化
     "sharpen_gamma": 0.5,
 }
 
