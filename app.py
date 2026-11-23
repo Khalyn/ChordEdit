@@ -49,13 +49,32 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "use_adaptive_delta": True,  # 默认开启时间自适应
     "adaptive_alpha": 0.5,
     "adaptive_floor": 0.2,
-    # ---- 清晰度增强模块（像素空间） ----
-    "use_sharpen_u": True,  # 默认开启像素空间锐化
+    # ---- HFC：细节探针（清晰度补全）----
+    "use_detail_probe": True,
+    "probe_t": 0.10,
+    "probe_hf_sigma": 1.0,
+    "probe_gate": 0.5,
+    "probe_gate_width": 0.15,
+    "use_energy_match": False,  # 实测在此管线下会削弱新增纹理，默认关闭
+    "use_vae_residual": False,  # VRR 被像素硬拷贝取代，仅作对照
+    # ---- EBC：边缘轮廓贴合 ----
+    "use_edge_fit": True,
+    "edge_radius": 8,
+    "edge_eps": 1e-3,
+    "edge_dc_strength": 0.5,
+    "use_alpha_remap": True,
+    "alpha_remap_lo": 0.30,
+    "alpha_remap_width": 0.30,
+    "pixel_beta": 0.0,
+    # ---- 对照基线（不属于本文方法）----
+    "use_sharpen_u": False,
     "sharpen_gamma": 0.5,
 }
 
 DEFAULT_SEED = 42
-DEFAULT_PRECISION = "fp32"
+# fp16 keeps the working set near 3 GB VRAM; fp32 needs ~5.3 GB for the weights
+# alone and does not fit on a 6 GB laptop GPU. Use --precision fp32 on >= 8 GB.
+DEFAULT_PRECISION = "fp16"
 DEFAULT_IMAGE_SIZE = 512
 DEFAULT_MAX_EXAMPLES = 24
 DEFAULT_SERVER_NAME = "127.0.0.1"
@@ -144,6 +163,13 @@ def parse_args() -> argparse.Namespace:
         help="Root folder containing unet/scheduler/text_encoder/tokenizer/vae subfolders.",
     )
     parser.add_argument("--server-port", type=int, default=DEFAULT_SERVER_PORT, help="Web server port.")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default=DEFAULT_PRECISION,
+        choices=["fp32", "fp16", "bf16"],
+        help="Inference precision. fp16 (default) fits a 6 GB GPU; fp32 needs > 8 GB.",
+    )
     return parser.parse_args()
 
 
@@ -264,6 +290,9 @@ def build_demo(
             t_start: float, t_end: float, t_delta: float, step_scale: float,
             use_local_chord, local_beta, mask_tau_low, mask_tau_high, mask_sigma,
             use_adaptive_delta, adaptive_alpha, adaptive_floor,
+            use_detail_probe, probe_t, probe_hf_sigma, probe_gate, probe_gate_width, use_energy_match,
+            use_edge_fit, edge_radius, edge_dc_strength,
+            use_alpha_remap, alpha_remap_lo, alpha_remap_width,
             use_sharpen_u, sharpen_gamma,
     ):
         _validate_inputs(image, source_prompt, target_prompt, t_start, t_end, t_delta)
@@ -285,7 +314,23 @@ def build_demo(
             "use_adaptive_delta": bool(use_adaptive_delta),
             "adaptive_alpha": float(adaptive_alpha),
             "adaptive_floor": float(adaptive_floor),
-            # ---- 清晰度增强模块（像素空间） ----
+            # ---- HFC：细节探针 + 门控 + 能量匹配 ----
+            "use_detail_probe": bool(use_detail_probe),
+            "probe_t": float(probe_t),
+            "probe_hf_sigma": float(probe_hf_sigma),
+            "probe_gate": float(probe_gate),
+            "probe_gate_width": float(probe_gate_width),
+            "use_energy_match": bool(use_energy_match),
+            "use_vae_residual": bool(default_edit_config.get("use_vae_residual", False)),
+            # ---- EBC：边缘轮廓贴合 + 近二值 alpha ----
+            "use_edge_fit": bool(use_edge_fit),
+            "edge_radius": int(edge_radius),
+            "edge_dc_strength": float(edge_dc_strength),
+            "use_alpha_remap": bool(use_alpha_remap),
+            "alpha_remap_lo": float(alpha_remap_lo),
+            "alpha_remap_width": float(alpha_remap_width),
+            "pixel_beta": float(default_edit_config.get("pixel_beta", 0.0)),
+            # ---- 对照基线 ----
             "use_sharpen_u": bool(use_sharpen_u),
             "sharpen_gamma": float(sharpen_gamma),
         }
@@ -329,7 +374,7 @@ def build_demo(
         # ---------------- 更新：参数调整指南 ----------------
         with gr.Accordion("📖 参数调整指南", open=False, elem_classes=["param-guide"]):
             gr.Markdown(
-                """
+                r"""
 **全局参数（作用于原版 ChordEdit，关闭本地开关时同样生效）**
 
 | 参数 | 往 **大** 调 | 往 **小** 调 | 推荐 | 论文依据 |
@@ -356,13 +401,28 @@ def build_demo(
 | `adaptive_alpha` (α) | 能量调制更强、更激进；**`0` 精确等价原版** | 退化为固定 δ | 0.3–0.8 |
 | `adaptive_floor` | 背景 δ 更大，更接近原版（更稳） | `0` 时背景融合几乎全取 `dv_s0`，易抖动 | 0.2–0.4 |
 
-#### 🛠 清晰度增强模块（Pixel-Space Enhancement）
+#### 🛠 HFC 清晰度补全（Detail Probe）
 
 | 参数 | 原理与效果 | 推荐范围 |
 |---|---|---|
-| **`use_sharpen_u`** | **像素空间锐化**。对最终输出图做 UnsharpMask，极大提升边缘和纹理清晰度，修复 VAE 解码造成的模糊。 | 开启 |
-| `sharpen_gamma` | 锐化强度。↑ 图像细节更锐，但太高可能导致噪点或边缘光晕。 | 0.3 – 0.8 |
+| **`use_detail_probe`** | 在极低噪声处再跑一次 UNet（+1 NFE），**只把高频带**换到编辑区；结构/语义仍来自 Chord 传输结果。实测 HF_fg 1.06→1.20。 | 开启 |
+| `probe_t` | 探针的噪声水平。↑ 重绘更强但可能漂移结构；↓ 只补纹理。 | 0.05 – 0.15 |
+| `probe_hf_sigma` | 频带分界（高斯低通 σ）。σ 越小只换最细纹理。 | 0.8 – 1.5 |
+| `probe_gate` / `probe_gate_width` | 门控中心与软过渡宽度，防止细节渗进背景。 | 0.5 / 0.15 |
+| `use_energy_match` | 用原图能量定标探针增益。**实测会把新增纹理（胡子、毛皮）拉回原区域水平而变糊**（HF_fg 1.20→1.04），默认关闭，仅作消融。 | 关闭 |
 
+#### 🛠 EBC 边缘轮廓贴合
+
+| 参数 | 原理与效果 | 推荐范围 |
+|---|---|---|
+| **`use_edge_fit`** | 用原图做引导滤波，把融合边界的 α 吸附到真实轮廓；再在接缝带补偿亮度/色差，去掉羽化亮边。实测 seam 0.0137→0.0113（−17%）。 | 开启 |
+| `edge_radius` | 引导滤波半径（像素）。0 = 关闭。 | 6 – 12 |
+| `edge_dc_strength` | 接缝带色差补偿强度。 | 0.3 – 0.7 |
+| **`use_alpha_remap`** | 能量 mask 被 γ 抬升过（背景里残留 0.2–0.4 的编辑泄漏），近二值化后背景才真正是背景。**实测 PSNR_bg 50.0→56.8 dB**。 | 开启 |
+| `alpha_remap_lo` / `alpha_remap_width` | 近二值化的阈值与过渡宽度。 | 0.30 / 0.30 |
+
+> 对照基线：`use_sharpen_u`（UnsharpMask 反锐化掩蔽）已被他人大量使用，且实测 PSNR_bg 掉到 43.6 dB、HF_fg 过冲到 1.41，仅保留用于消融。
+>
 > 提示：mask 面板为空说明当前 `use_local_chord=False`，属正常情况。
                 """
             )
@@ -480,18 +540,99 @@ def build_demo(
                             info="0 时背景 δ→0，融合几乎全取 dv_s0，易抖动；推荐 0.20–0.40 保留最小噪声端信息。",
                         )
 
-                # ---------------- 更新：清晰度增强（已彻底移除潜空间参数） ----------------
-                use_sharpen_u = gr.Checkbox(
-                    label="1. Sharpen Result (Pixel-Space Unsharp Mask)",
-                    value=True,  # 默认开启
-                    info="在像素空间对最终结果进行锐化，极大提升清晰度（零 NFE）。",
+                # ---------------- HFC / EBC：清晰度补全 + 边缘轮廓贴合 ----------------
+                use_detail_probe = gr.Checkbox(
+                    label="1. Detail Probe (HFC · 细节探针，+1 NFE)",
+                    value=bool(default_edit_config.get("use_detail_probe", True)),
+                    info="在极低噪声处再跑一次 UNet，只把高频带换到编辑区（不改结构、不动网络）。这是清晰度提升的主力。",
                 )
-                with gr.Accordion("Control Field Sharpen Parameters", open=False):
+                with gr.Accordion("Detail Probe Parameters", open=False):
+                    with gr.Row():
+                        probe_t_input = gr.Slider(
+                            label="probe_t (探针噪声水平 t)",
+                            minimum=0.0, maximum=0.4, step=0.01,
+                            value=float(default_edit_config.get("probe_t", 0.10)),
+                            info="↑ 重绘更强但结构漂移风险↑；↓ 只补纹理。推荐 0.05–0.15。",
+                        )
+                        probe_hf_sigma_input = gr.Slider(
+                            label="probe_hf_sigma (频带分界 σ)",
+                            minimum=0.3, maximum=3.0, step=0.1,
+                            value=float(default_edit_config.get("probe_hf_sigma", 1.0)),
+                            info="高斯低通半径：σ 小 → 只替换最细的纹理；σ 大 → 连中频一起换。推荐 0.8–1.5。",
+                        )
+                    with gr.Row():
+                        probe_gate_input = gr.Slider(
+                            label="probe_gate (门控中心 τ)",
+                            minimum=0.0, maximum=1.0, step=0.05,
+                            value=float(default_edit_config.get("probe_gate", 0.5)),
+                            info="只在 α>τ 的区域注入细节，防止渗进背景。",
+                        )
+                        probe_gate_width_input = gr.Slider(
+                            label="probe_gate_width (门控过渡宽度 w)",
+                            minimum=0.02, maximum=0.5, step=0.01,
+                            value=float(default_edit_config.get("probe_gate_width", 0.15)),
+                            info="门控的软过渡宽度，避免硬边界。",
+                        )
+                    use_energy_match = gr.Checkbox(
+                        label="energy matching (能量匹配，默认关)",
+                        value=bool(default_edit_config.get("use_energy_match", False)),
+                        info="实测会把新增纹理拉回原区域水平（HF_fg 1.20→1.04），默认关闭，仅作消融。",
+                    )
+
+                use_edge_fit = gr.Checkbox(
+                    label="2. Edge-Boundary Compositing (EBC · 边缘轮廓贴合)",
+                    value=bool(default_edit_config.get("use_edge_fit", True)),
+                    info="引导滤波把融合边界吸附到原图真实轮廓 + 接缝带色差补偿，消除羽化亮边。",
+                )
+                with gr.Accordion("Edge Fitting Parameters", open=False):
+                    with gr.Row():
+                        edge_radius_input = gr.Slider(
+                            label="edge_radius (引导滤波半径)",
+                            minimum=0.0, maximum=24.0, step=1.0,
+                            value=float(default_edit_config.get("edge_radius", 8)),
+                            info="0 = 关闭引导滤波；8 ≈ 8 像素。越大越平滑、越小越贴细节。",
+                        )
+                        edge_dc_input = gr.Slider(
+                            label="edge_dc_strength (接缝色差补偿强度)",
+                            minimum=0.0, maximum=1.0, step=0.05,
+                            value=float(default_edit_config.get("edge_dc_strength", 0.5)),
+                            info="在 α≈0.5 的接缝带上估计并抵消亮度/色差偏移。推荐 0.3–0.7。",
+                        )
+                    use_alpha_remap = gr.Checkbox(
+                        label="near-binary alpha (近二值化 mask)",
+                        value=bool(default_edit_config.get("use_alpha_remap", True)),
+                        info="能量 mask 被 γ 抬升过，背景里残留 0.2~0.4 的编辑泄漏；近二值化后背景才真正是背景。",
+                    )
+                    with gr.Row():
+                        alpha_remap_lo_input = gr.Slider(
+                            label="alpha_remap_lo",
+                            minimum=0.0, maximum=0.9, step=0.05,
+                            value=float(default_edit_config.get("alpha_remap_lo", 0.30)),
+                            info="α 低于此值 → 判为背景。↑ 编辑区更小更干净，但可能切掉弱编辑。",
+                        )
+                        alpha_remap_width_input = gr.Slider(
+                            label="alpha_remap_width",
+                            minimum=0.05, maximum=0.6, step=0.05,
+                            value=float(default_edit_config.get("alpha_remap_width", 0.30)),
+                            info="过渡宽度。↑ 更柔和；↓ 更硬。",
+                        )
+
+                gr.Markdown(
+                    "> 对照基线（不属于本文方法）：`Unsharp Mask` 反锐化掩蔽已被他人大量使用，"
+                    "且实测背景 PSNR 掉到 43.6 dB、HF_fg 过冲到 1.41。仅保留用于消融对比。",
+                    elem_classes=["panel-note"],
+                )
+                use_sharpen_u = gr.Checkbox(
+                    label="[legacy] Unsharp Mask baseline (default off)",
+                    value=bool(default_edit_config.get("use_sharpen_u", False)),
+                    info="反锐化掩蔽基线，默认关闭。",
+                )
+                with gr.Accordion("Legacy Unsharp Parameters", open=False):
                     sharpen_gamma_input = gr.Slider(
                         label="sharpen_gamma (锐化强度)",
                         minimum=0.0, maximum=2.0, step=0.1,
                         value=float(default_edit_config.get("sharpen_gamma", 0.5)),
-                        info="↑ 边缘更锐利但可能出现光晕；↓ 边缘较平滑。推荐 0.3–0.8。",
+                        info="↑ 边缘更锐利但出现光晕；仅用于基线对比。",
                     )
                 # --------------------------------------------------------------------------------
 
@@ -527,6 +668,10 @@ def build_demo(
             use_local_chord, local_beta_input,
             mask_tau_low_input, mask_tau_high_input, mask_sigma_input,
             use_adaptive_delta, adaptive_alpha_input, adaptive_floor_input,
+            use_detail_probe, probe_t_input, probe_hf_sigma_input,
+            probe_gate_input, probe_gate_width_input, use_energy_match,
+            use_edge_fit, edge_radius_input, edge_dc_input,
+            use_alpha_remap, alpha_remap_lo_input, alpha_remap_width_input,
             use_sharpen_u, sharpen_gamma_input,
         ]
         run_outputs = [output_image, mask_output, overlay_output]
@@ -574,8 +719,10 @@ def main() -> None:
     component_paths = _resolve_component_paths(model_root=args.model_root)
     edit_config = dict(DEFAULT_EDIT_CONFIG)
     seed = DEFAULT_SEED
-    torch_dtype = _dtype_from_precision(DEFAULT_PRECISION)
-    compute_dtype = torch.float32
+    torch_dtype = _dtype_from_precision(args.precision)
+    # weight dtype and compute dtype must match, otherwise the modules are cast
+    # back to fp32 right after loading and the fp16 path is lost.
+    compute_dtype = torch_dtype
 
     dataset_root = DEFAULT_DATA_ROOT
     examples = load_examples(dataset_root=dataset_root, max_examples=DEFAULT_MAX_EXAMPLES)

@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps, ImageFilter
+
+import hfc as hfc_ops
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -31,6 +33,8 @@ class ChordEditPipelineOutput(BaseOutput):
     images: List[Image.Image] | torch.Tensor
     latents: torch.Tensor
     masks: Optional[torch.Tensor] = None  # ← 新增，仅 return_mask=True 时非 None
+    alphas: Optional[torch.Tensor] = None  # ← 实际用于融合的 512x512 soft mask
+    sources: Optional[torch.Tensor] = None  # ← 内部对齐后的源图 (B,3,512,512) ∈ [0,1]
 
 
 class _CenterSquareCropTransform:
@@ -193,6 +197,7 @@ class ChordEditPipeline(DiffusionPipeline):
             seed: Optional[int] = None,
             output_type: str = "pil",
             return_mask: bool = False,
+            return_source: bool = False,
     ) -> ChordEditPipelineOutput:
         """Run ChordEdit once on a single image."""
 
@@ -210,7 +215,6 @@ class ChordEditPipeline(DiffusionPipeline):
         tgt_embed = self.encode_prompt([target_prompt])
 
         output_latents: List[torch.Tensor] = []
-        decoded_batches: List[torch.Tensor] = []
 
         edit_params = self._prepare_edit_params(cfg)
         seed_value = int(seed) if seed is not None else DEFAULT_SEED
@@ -232,64 +236,135 @@ class ChordEditPipeline(DiffusionPipeline):
         decoded = self._decode_latent_to_image(x0_pred)
         decoded, _ = self._apply_safety_checker(decoded)
 
-        output_latents.append(x0_pred.detach().cpu())
-        decoded_batches.append(decoded.detach().cpu())
+        # =======================================================
+        # HFC / EBC：像素级高频补全 + 边缘轮廓贴合
+        #   （VRR 残差回填 / DP 细节探针 + 能量匹配 / 引导滤波 alpha + 接缝补偿）
+        # =======================================================
+        images_tensor, alpha_tensor = self._enhance_pixels(
+            decoded=decoded,
+            x0_pred=x0_pred,
+            x_src=latents,
+            src_pixels=pixel_values,
+            edit_embed=tgt_embed,
+            noise=noise_list,
+            mask=final_mask,
+            params=edit_params,
+        )
 
-        images_tensor = torch.cat(decoded_batches, dim=0)
+        output_latents.append(x0_pred.detach().cpu())
         latents_tensor = torch.cat(output_latents, dim=0)
         images = self._tensor_to_pil(images_tensor) if output_type == "pil" else images_tensor
 
-        # =======================================================
-        # 创新点操作：全部转移到 512x512 像素空间进行
-        # =======================================================
-        if isinstance(images, list):
-            # 1. 像素空间的背景保护 (Spatial Background Anchoring)
-            if edit_params.get("use_local_chord", False) and final_mask is not None:
-                # 【修复】完全使用经过中心裁剪和对齐的 pixel_values 还原背景
-                src_tensor = pixel_values[0].cpu().float()
-                src_tensor = (src_tensor * 0.5 + 0.5).clamp(0.0, 1.0)  # [-1, 1] -> [0, 1]
-                src_pil = transforms.ToPILImage()(src_tensor)
-
-                # 把潜空间的 mask 放大到 512x512，并做羽化，防止接缝 (半径3即可，8太糊了)
-                mask_pil = Image.fromarray((final_mask[0, 0].cpu().numpy() * 255).astype(np.uint8)).resize(
-                    images[0].size, Image.BILINEAR
-                )
-                mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(radius=3))
-                mask_np = np.array(mask_pil).astype(np.float32) / 255.0
-                mask_np = mask_np[..., None]  # (H, W, 1)
-
-                beta = edit_params.get("local_beta", 0.0)
-                mask_weight = mask_np + (1.0 - mask_np) * beta
-
-                gen_np = np.array(images[0]).astype(np.float32)
-                src_np = np.array(src_pil).astype(np.float32)
-
-                mixed = gen_np * mask_weight + src_np * (1.0 - mask_weight)
-                images = [Image.fromarray(mixed.astype(np.uint8))]
-
-            # 2. 像素空间的高频清晰度增强
-            if edit_params.get("use_sharpen_u", False):
-                sharpened_images = []
-                percent = int(edit_params.get("sharpen_gamma", 0.5) * 100)
-                if percent > 0:
-                    for img in images:
-                        sharpened = img.filter(ImageFilter.UnsharpMask(
-                            radius=2.0,
-                            percent=percent,
-                            threshold=3
-                        ))
-                        sharpened_images.append(sharpened)
-                    images = sharpened_images
+        # ---- 遗留对照基线：像素空间 UnsharpMask（仅用于消融对比，不属于本文方法）----
+        if isinstance(images, list) and edit_params.get("use_sharpen_u", False):
+            LOGGER.warning("use_sharpen_u is a legacy unsharp-mask baseline, disabled by default for a reason.")
+            percent = int(edit_params.get("sharpen_gamma", 0.5) * 100)
+            if percent > 0:
+                images = [
+                    img.filter(ImageFilter.UnsharpMask(radius=2.0, percent=percent, threshold=3))
+                    for img in images
+                ]
         # =======================================================
         return ChordEditPipelineOutput(
             images=images,
             latents=latents_tensor,
             masks=final_mask.detach().cpu() if (return_mask and final_mask is not None) else None,
+            alphas=alpha_tensor.detach().cpu() if return_mask else None,
+            sources=(pixel_values.to(dtype=torch.float32) * 0.5 + 0.5).clamp(0.0, 1.0).detach().cpu()
+            if return_source
+            else None,
         )
 
     def encode_prompt(self, prompts: Sequence[str]) -> torch.Tensor:
         """Public helper mirroring diffusers pipelines for text encoding."""
         return self._encode_text(prompts)
+
+    # ------------------------------------------------------------------ #
+    # HFC / EBC : pixel-space detail restoration
+    # ------------------------------------------------------------------ #
+    @torch.no_grad()
+    def _enhance_pixels(
+            self,
+            *,
+            decoded: torch.Tensor,
+            x0_pred: torch.Tensor,
+            x_src: torch.Tensor,
+            src_pixels: torch.Tensor,
+            edit_embed: torch.Tensor,
+            noise: List[torch.Tensor],
+            mask: Optional[torch.Tensor],
+            params: Dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply VRR / DP / energy matching / edge fitting on the decoded image.
+
+        All arithmetic happens in float32 pixels in [0, 1]; the edit structure is
+        never modified -- only the detail band and the composite boundary are.
+
+        Returns ``(image, alpha)`` where ``alpha`` is the 512x512 soft mask that
+        was actually used for compositing (useful for metrics and debugging).
+        """
+        device = decoded.device
+        out_dtype = decoded.dtype
+        batch, _, height, width = decoded.shape
+
+        img_src = (src_pixels.to(device=device, dtype=torch.float32) * 0.5 + 0.5).clamp(0.0, 1.0)
+        img = decoded.to(dtype=torch.float32)
+
+        use_local = bool(params.get("use_local_chord", False)) and mask is not None
+        if use_local:
+            alpha = F.interpolate(
+                mask.to(device=device, dtype=torch.float32),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).clamp(0.0, 1.0)
+            # 能量 mask 为了不切断编辑被 gamma 抬升过（背景里 α 常有 0.2~0.4），
+            # 直接拿来做融合会把编辑漏进背景。近二值化统一在 _run_edit 里做一次，
+            # 这里只负责上采样与轮廓对齐（否则会重复 remap）。
+            if params.get("use_edge_fit", False):
+                # 让边界贴着原图的真实轮廓走，而不是 8x 上采样出的方块边
+                alpha = hfc_ops.guided_filter(
+                    alpha, img_src, radius=int(params.get("edge_radius", 8)), eps=float(params.get("edge_eps", 1e-3))
+                )
+                alpha = hfc_ops.gaussian_blur(alpha, sigma=0.5)
+            else:
+                feather = float(params.get("mask_feather_px", 3.0))
+                if feather > 0:
+                    alpha = hfc_ops.gaussian_blur(alpha, sigma=feather)
+        else:
+            alpha = torch.ones((batch, 1, height, width), device=device, dtype=torch.float32)
+
+        # ---- (1) DP：低噪声细节探针，只替换被门控选中的高频带 ----
+        if params.get("use_detail_probe", False) and float(params.get("probe_t", 0.0)) > 0.0:
+            probe_steps = self._time_to_index(batch, float(params["probe_t"]), device=device)
+            x_probe = self._pred_x0(x0_pred, probe_steps, edit_embed, noise[0])
+            img_probe = self._decode_latent_to_image(x_probe).to(device=device, dtype=torch.float32)
+            img = hfc_ops.detail_completion(img, img_probe, alpha, img_src, params)
+
+        # ---- (2) VRR：把 VAE 往返的已知损失补回非编辑区 ----
+        if use_local:
+            if params.get("use_vae_residual", False) and float(params.get("vae_residual_alpha", 1.0)) > 0.0:
+                vae_recon = self._decode_latent_to_image(x_src).to(device=device, dtype=torch.float32)
+                img = hfc_ops.vae_residual_restore(
+                    img, vae_recon, img_src, alpha, strength=float(params.get("vae_residual_alpha", 1.0))
+                )
+            else:
+                img = hfc_ops.composite_background(
+                    img, img_src, alpha, beta=float(params.get("pixel_beta", 0.0))
+                )
+
+            # ---- (3) EBC：消掉羽化带上的色差/曝光差，去掉亮边 ----
+            strength = float(params.get("edge_dc_strength", 0.0)) if params.get("use_edge_fit", False) else 0.0
+            if strength > 0.0:
+                img = hfc_ops.seam_compensation(
+                    img,
+                    img_src,
+                    alpha,
+                    radius=max(4, int(params.get("edge_radius", 8))),
+                    strength=strength,
+                )
+
+        return img.clamp(0.0, 1.0).to(dtype=out_dtype), alpha
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -453,6 +528,41 @@ class ChordEditPipeline(DiffusionPipeline):
         params["use_latent_sharp"] = bool(params.get("use_latent_sharp", False))
         params["latent_sharp_bg"] = float(max(0.0, float(params.get("latent_sharp_bg", 0.5))))
         params["latent_sharp_fg"] = float(max(0.0, float(params.get("latent_sharp_fg", 0.2))))
+        # -------------------------------------
+
+        # ---- HFC：高频补全（VRR + DP + 能量匹配）----
+        params["use_vae_residual"] = bool(params.get("use_vae_residual", True))
+        params["vae_residual_alpha"] = float(max(0.0, float(params.get("vae_residual_alpha", 1.0))))
+        # 像素阶段背景回填比例（与 latent 阶段的 local_beta 解耦）：
+        # 0 = 背景完全取原图像素（保真最高），1 = 完全用生成结果
+        params["pixel_beta"] = float(max(0.0, min(1.0, float(params.get("pixel_beta", 0.0)))))
+        params["use_detail_probe"] = bool(params.get("use_detail_probe", True))
+        params["probe_t"] = float(max(0.0, min(1.0, float(params.get("probe_t", 0.10)))))
+        params["probe_hf_sigma"] = float(max(0.1, float(params.get("probe_hf_sigma", 1.0))))
+        params["probe_gate"] = float(max(0.0, min(1.0, float(params.get("probe_gate", 0.5)))))
+        params["probe_gate_width"] = float(max(0.0, min(0.5, float(params.get("probe_gate_width", 0.15)))))
+        # 实测：DP 是"频带替换"而非"增益放大"，标量能量匹配会把新增纹理（胡子、毛皮）
+        # 拉回原区域的光滑水平，反而变糊（HF_fg 1.14 -> 0.94）。默认关闭，作为消融保留。
+        params["use_energy_match"] = bool(params.get("use_energy_match", False))
+        if params["use_energy_match"]:
+            params["energy_match_lo"] = float(max(0.0, float(params.get("energy_match_lo", 0.5))))
+            params["energy_match_hi"] = float(max(0.0, float(params.get("energy_match_hi", 2.5))))
+        else:
+            params["energy_match_lo"] = 1.0
+            params["energy_match_hi"] = 1.0
+        ref = str(params.get("energy_match_ref", "global")).lower()
+        params["energy_match_ref"] = ref if ref in ("region", "global") else "global"
+
+        # ---- EBC：边缘轮廓贴合（引导滤波 mask + 接缝色差补偿）----
+        params["use_edge_fit"] = bool(params.get("use_edge_fit", True))
+        params["edge_radius"] = int(max(0, int(params.get("edge_radius", 8))))
+        params["edge_eps"] = float(max(1e-6, float(params.get("edge_eps", 1e-3))))
+        params["edge_dc_strength"] = float(max(0.0, min(1.0, float(params.get("edge_dc_strength", 0.5)))))
+        params["mask_feather_px"] = float(max(0.0, float(params.get("mask_feather_px", 3.0))))
+        params["use_alpha_remap"] = bool(params.get("use_alpha_remap", True))
+        params["use_latent_alpha_remap"] = bool(params.get("use_latent_alpha_remap", True))
+        params["alpha_remap_lo"] = float(max(0.0, min(1.0, float(params.get("alpha_remap_lo", 0.30)))))
+        params["alpha_remap_width"] = float(max(1e-3, float(params.get("alpha_remap_width", 0.30))))
         # -------------------------------------
 
         return params
@@ -650,6 +760,9 @@ class ChordEditPipeline(DiffusionPipeline):
         tau_lo = params["mask_tau_low"]
         tau_hi = params["mask_tau_high"]
         sigma = params["mask_sigma"]
+        remap_lo = float(params.get("alpha_remap_lo", 0.30))
+        remap_w = max(1e-6, float(params.get("alpha_remap_width", 0.30)))
+        remap_latent = bool(params.get("use_alpha_remap", True))
 
         x_curr = x_src
         last_mask: Optional[torch.Tensor] = None
@@ -673,6 +786,9 @@ class ChordEditPipeline(DiffusionPipeline):
             # 2. Transport 更新
             if use_local:
                 mask = self._energy_mask(u_hat, tau_lo, tau_hi, sigma)  # (B,1,H,W)
+                if remap_latent:
+                    # 与像素阶段同一套近二值化，保证"背景 latent == 源 latent"严格成立
+                    mask = ((mask - remap_lo) / remap_w).clamp(0.0, 1.0)
                 last_mask = mask
                 if params.get("local_apply_transport", True):
                     u_local = mask * u_hat + (1.0 - mask) * beta * u_hat
