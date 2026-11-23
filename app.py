@@ -67,7 +67,7 @@ DEFAULT_EDIT_CONFIG: Dict[str, Any] = {
     "alpha_remap_width": 0.30,
     "pixel_beta": 0.0,
     # ---- 对照基线（不属于本文方法）----
-    "use_sharpen_u": False,
+    "use_sharpen_u": True,  # 团队既有模块，保持上游默认
     "sharpen_gamma": 0.5,
 }
 
@@ -421,7 +421,14 @@ def build_demo(
 | **`use_alpha_remap`** | 能量 mask 被 γ 抬升过（背景里残留 0.2–0.4 的编辑泄漏），近二值化后背景才真正是背景。**实测 PSNR_bg 50.0→56.8 dB**。 | 开启 |
 | `alpha_remap_lo` / `alpha_remap_width` | 近二值化的阈值与过渡宽度。 | 0.30 / 0.30 |
 
-> 对照基线：`use_sharpen_u`（UnsharpMask 反锐化掩蔽）已被他人大量使用，且实测 PSNR_bg 掉到 43.6 dB、HF_fg 过冲到 1.41，仅保留用于消融。
+#### 🛠 像素空间锐化（团队既有模块，保持原样）
+
+| 参数 | 原理与效果 | 推荐范围 |
+|---|---|---|
+| **`use_sharpen_u`** | **像素空间锐化**。对最终输出图做 UnsharpMask，极大提升边缘和纹理清晰度，修复 VAE 解码造成的模糊。 | 开启 |
+| `sharpen_gamma` | 锐化强度。↑ 图像细节更锐，但太高可能导致噪点或边缘光晕。 | 0.3 – 0.8 |
+
+> 说明：本分支新增的 EBC / HFC 与上面的锐化模块**互相独立**，可单独开关、组合使用。
 >
 > 提示：mask 面板为空说明当前 `use_local_chord=False`，属正常情况。
                 """
@@ -617,22 +624,17 @@ def build_demo(
                             info="过渡宽度。↑ 更柔和；↓ 更硬。",
                         )
 
-                gr.Markdown(
-                    "> 对照基线（不属于本文方法）：`Unsharp Mask` 反锐化掩蔽已被他人大量使用，"
-                    "且实测背景 PSNR 掉到 43.6 dB、HF_fg 过冲到 1.41。仅保留用于消融对比。",
-                    elem_classes=["panel-note"],
-                )
                 use_sharpen_u = gr.Checkbox(
-                    label="[legacy] Unsharp Mask baseline (default off)",
-                    value=bool(default_edit_config.get("use_sharpen_u", False)),
-                    info="反锐化掩蔽基线，默认关闭。",
+                    label="1. Sharpen Result (Pixel-Space Unsharp Mask)",
+                    value=True,  # 默认开启（团队既有模块，保持原样）
+                    info="在像素空间对最终结果进行锐化，极大提升清晰度（零 NFE）。",
                 )
-                with gr.Accordion("Legacy Unsharp Parameters", open=False):
+                with gr.Accordion("Control Field Sharpen Parameters", open=False):
                     sharpen_gamma_input = gr.Slider(
                         label="sharpen_gamma (锐化强度)",
                         minimum=0.0, maximum=2.0, step=0.1,
                         value=float(default_edit_config.get("sharpen_gamma", 0.5)),
-                        info="↑ 边缘更锐利但出现光晕；仅用于基线对比。",
+                        info="↑ 边缘更锐利但可能出现光晕；↓ 边缘较平滑。推荐 0.3–0.8。",
                     )
                 # --------------------------------------------------------------------------------
 

@@ -26,8 +26,8 @@ combination raises background PSNR from 50.0 dB to 56.6 dB, moves the background
 energy ratio from 0.944 to 1.002, increases foreground high-band energy by 13%, and reduces a
 boundary-discontinuity metric by 17%, at the cost of one additional function evaluation
 (+0.26 s). We additionally report two negative results: VAE residual recovery is subsumed by
-pixel-space compositing (44.1 dB vs 56.6 dB), and unsharp masking over-shoots (HF 1.41) while
-degrading background fidelity.
+pixel-space compositing (44.1 dB vs 56.6 dB), and the pixel-space sharpening module that already
+exists in the codebase over-shoots (HF 1.41) while degrading background fidelity.
 
 ---
 
@@ -70,7 +70,10 @@ We address (3) and (4). Our contributions are:
 - **HFC (High-Frequency Completion).** One extra UNet probe at low noise, from which only the
   high band is taken and injected inside a gated edit region. The probe *replaces* rather than
   amplifies, so no sharpening gain has to be tuned, and no halo is introduced.
-- **Ablations including negative results** on VAE residual recovery (VRR) and unsharp masking.
+- **Ablations including negative results** on VAE residual recovery (VRR) and on the
+  pixel-space sharpening module that already exists in the codebase; we show the sharpening
+  operator and our modules are not re-parameterizations of each other (§4.5), and that ours is
+  the only one of the two that leaves the background bit-exact.
 
 ---
 
@@ -92,8 +95,17 @@ derived from the model's own control-field energy.
 **Detail and frequency.** FreeU re-weights U-Net backbone/skip features for crisper output,
 HiPA learns a high-frequency adapter for one-step models, and FDS performs wavelet-band-
 selective editing. All three either modify the network or require training; ours is inference
-only and leaves the U-Net untouched. Classic unsharp masking is the trivial alternative but
-amplifies existing artefacts, including the VAE blur it is meant to hide.
+only and leaves the U-Net untouched.
+
+**Pixel-space sharpening (existing module in the same codebase).** The ChordEdit fork we build
+on already ships a pixel-space unsharp-mask filter (`I + k(I-G(I))`, fixed `k`, applied to the
+whole output). We leave that module untouched and treat it as an independent, concurrent
+baseline. It is a fundamentally different operator from ours: it *amplifies* whatever high
+frequencies are already present — including VAE blur artefacts and sensor noise — with a
+single global gain, and it cannot introduce texture that the edit is missing. Our modules
+instead (i) change *which pixels* the background is taken from (no filtering at all), and
+(ii) *re-synthesize* the high band with one extra conditioned UNet evaluation inside the edited
+region. Sec. 4.5 shows the two are not re-parameterizations of each other.
 
 **Compositing.** Guided filtering (He et al.) is a standard edge-aware operator used in
 matting and detail transfer; we use it to regularize the edit mask toward image contours, and
@@ -178,8 +190,9 @@ $$g=\mathrm{clamp}\!\left(\frac{\alpha-(\tau-w_g)}{2w_g},0,1\right),\quad \tau=0
 $$I_{\text{out}} = g\odot\big(\mathrm{low}(I_e) + s\cdot \mathrm{high}(I_p)\big) + (1-g)\odot I_e .$$
 
 Because the probe is a *replacement* operator, $s=1$: the model's own detail level is the
-target, and no sharpening gain has to be tuned per image. We deliberately do **not** use
-unsharp masking; Sec. 4.4 quantifies why.
+target, and no sharpening gain has to be tuned per image. HFC-DP is therefore not a sharpening
+filter: it never multiplies an existing high band, it replaces it with a newly synthesized one;
+the existing pixel-space sharpening module of the codebase is compared in Sec. 4.5.
 
 ### 3.5 Cost
 
@@ -215,18 +228,19 @@ $\overline{|\nabla I-\nabla I_s|}$ restricted to the boundary band $4\alpha(1-\a
 | + EBC (guided α + seam DC) | 2 | 56.57 | 0.9997 | 1.002 | 1.059 | 0.00387 | 0.01134 | 0.70 s |
 | **+ HFC-DP (full)** | 3 | 56.57 | 0.9997 | 1.002 | **1.202** | 0.00399 | **0.01137** | 0.97 s |
 | VRR (VAE residual recovery) | 2 | 44.07 | 0.9922 | 1.072 | 1.059 | 0.00387 | 0.01765 | 0.88 s |
-| Unsharp masking | 2 | 43.63 | 0.9922 | 1.124 | 1.412 | 0.00796 | 0.01427 | 0.70 s |
+| Existing sharpening module (unsharp, unchanged) | 2 | 43.63 | 0.9922 | 1.124 | 1.412 | 0.00796 | 0.01427 | 0.70 s |
 
 Reading: the remap alone accounts for **+6.8 dB** of background PSNR and recovers the high band
 (0.944 → 1.003). EBC leaves fidelity intact while reducing the seam by 17%. HFC-DP adds 13% of
 foreground high-band energy at constant background/seam behaviour and one extra NFE.
-Unsharp masking reaches an even higher foreground HF (1.41) but at the cost of 7 dB of
-background PSNR and a visibly ringed structure; VRR trades 12 dB of background fidelity for a
-marginal HF gain.
+The existing sharpening module reaches an even higher foreground HF (1.41) but costs 7 dB of
+background PSNR and leaves a visibly ringed structure; VRR trades 12 dB of background fidelity
+for a marginal HF gain.
 
 Figure (`docs/figures/comparison.png`) shows qualitative crops: the upstream background is
 slightly soft and the seam is visible on the shoulder contour; EBC removes the fringe;
-HFC-DP restores stubble and fur strands; unsharp masking produces halos on the collar.
+HFC-DP restores stubble and fur strands; the existing sharpening module produces halos on the
+collar.
 
 ### 4.3 Ablation: is the probe's gain calibrated?
 
@@ -253,6 +267,34 @@ anchor is exact. Since the pixel-space copy already restores the background exac
 only *degrade* it: 44.07 dB vs 56.57 dB. Its only advantage is a marginally higher whole-image
 HF ratio (0.992 vs 1.002 in the other direction — see table), which is precisely the blur it
 reintroduces. We keep it as an option for pipelines that lack a pixel-space copy.
+
+### 4.5 Is this just sharpening? (relation to the existing sharpening module)
+
+The codebase already contains a pixel-space unsharp-mask module. We keep it untouched and
+report it in the same table, because a reviewer may reasonably ask whether HFC-DP is a
+re-parameterization of it. The numbers say no: the two trade off in opposite directions.
+
+| | Existing sharpening module | HFC-DP (ours) |
+|---|---|---|
+| Operator | amplifies existing HF, `I + k(I-G(I))` | re-synthesizes the HF band from a conditioned UNet probe |
+| Gain | one global, hand-tuned `k` | none ($s=1$); spatial gate only |
+| Support | whole image, incl. background noise and VAE artefacts | gated edit region; background untouched |
+| Can create missing texture? | no | yes (beard hairs, fur, satin highlights) |
+| PSNR_bg | 43.63 | 56.57 |
+| HF_fg | 1.412 (over-shoot) | 1.202 |
+| seam | 0.01427 | 0.01137 |
+| extra NFE | 0 | 1 |
+
+The sharpening module reaches the highest foreground HF ratio, but it pays 13 dB of background
+PSNR and produces visible halos at the collar and hairline; it is also the only variant whose
+background high band overshoots the source (1.124). Ours keeps the background at the source's
+own energy (1.002) and confines the added detail to the gate. We therefore treat the two as
+complementary rather than competing: the existing module is a post-hoc global filter, ours
+changes the provenance of pixels and the geometry of the composite.
+
+> Implementation note: both modules coexist in `app.py` as independent switches; the existing
+> module keeps its original code, default value and UI. Our evaluation configuration disables
+> it so that the measured gains are attributable to EBC/HFC alone.
 
 ---
 
@@ -290,20 +332,30 @@ reintroduces. We keep it as an option for pipelines that lack a pixel-space copy
 （ii）编辑区的细节相对"完美锐利"的背景显得更糊。我们的贡献是把 mask 变成"贴轮廓的近二值
 α"（EBC）+ 用一次低噪声探针只替换高频带（HFC），全部免训练、不改网络。
 
+**关于"不和别人做重"**：团队里已有的**像素空间锐化（UnsharpMask）模块我完全没动**——
+代码、默认值、UI、参数说明都保持上游原样，两个模块是并列开关。论文里专门加了 **§4.5**
+说明两者为什么不是同一件事（放大 vs 重合成、全图固定增益 vs 门控内无增益、背景会不会被污染），
+并用同一张表给出对照数字。所以：
+
+- 我们的方法**没有删除/改写任何别人的代码**；
+- 我们的贡献**不依赖锐化**：EBC 完全是几何/像素来源问题（不做任何滤波），HFC-DP 是"重合成"
+  而不是"放大"；
+- 如果老师希望我们的工作和锐化**彻底不沾边**，可以把 `use_detail_probe` 默认关掉，只保留
+  EBC（此时仍能拿到 PSNR_bg +6.8 dB、HF_bg→1.00、seam −17%），论文里把 DP 降级为可选扩展。
+
 **需要你确认的 5 件事：**
 
-1. **标题/定位**：现在的题目强调"细节补全 + 轮廓贴合"，与老师原论文的"低能量传输"是互补
-   关系而非竞争关系。是否要更突出"πars 到背景保护"？
+1. **定位**：现在题目强调"细节补全 + 轮廓贴合"，与老师原论文的"低能量传输"是互补关系。是否
+   要更强调"背景保真/背景完整性"这条线（毕竟 HF_bg 从 0.944 回到 1.002 是最硬的数字）？
 2. **数据**：目前只有 8 张示例图。投稿前必须补 PIE-Bench（700 张）+ CLIP/LPIPS，否则审稿人
    一定会打回。要不要我先把评测脚本接到 PIE-Bench 的格式上？
-3. **是否保留 VRR 的负面结论**：我在 §4.4 明确写了 VRR 在这条管线下被像素拷贝取代。好处是
-   诚实、能挡住"你们不就是抄了技术报告"的质疑；坏处是和你们之前的 md 结论冲突。建议保留，
+3. **是否保留 VRR 的负面结论**：§4.4 写了 VRR 在这条管线下被像素拷贝取代。好处是诚实、
+   能挡住"你们不就是把技术报告搬了一遍"的质疑；坏处是和你们 md 的结论不一致。建议保留，
    并在正文加一句"VRR 适用于没有像素拷贝的潜空间管线"。
-4. **能量匹配的处理**：报告里它是"采纳"，我这里实测有害、改为消融项。这是与 md 的第二处冲突，
-   证据在 §4.3 的表格（1.202 / 1.036 / 0.941）。你可以接受哪种口径？
-5. **LaTeX 落地**：现在结构已经按 CVPR 风格（Abstract/Intro/Related/Method/Experiments/
-   Limitations）写好，公式是 LaTeX 片段，可以直接搬进 cstcloud 的模板。需要我下一步直接生成
-   `.tex` + `.bib` 吗？
+4. **能量匹配的处理**：md 里是"采纳"，我这里实测有害、改为消融（§4.3：1.202 / 1.036 / 0.941）。
+   这是与 md 的两处不一致之一，你可以选口径。
+5. **LaTeX 落地**：结构已按 CVPR 风格写好，公式是 LaTeX 片段，可直接搬进 cstcloud 模板。
+   需要我下一步直接生成 `.tex` + `.bib` 吗？
 
 **还没做的实验**（我可以补）：PIE-Bench 全量、LPIPS、CLIP-Edited、α 阈值敏感性曲线、
 DP 的自适应开关（省 1 NFE）、与 FreeU/HiPA 的对比（后者需训练，可只做讨论不跑）。

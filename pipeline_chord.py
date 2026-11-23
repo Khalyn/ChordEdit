@@ -255,15 +255,19 @@ class ChordEditPipeline(DiffusionPipeline):
         latents_tensor = torch.cat(output_latents, dim=0)
         images = self._tensor_to_pil(images_tensor) if output_type == "pil" else images_tensor
 
-        # ---- 遗留对照基线：像素空间 UnsharpMask（仅用于消融对比，不属于本文方法）----
+        # ---- 像素空间的高频清晰度增强（团队既有模块，保持原样，与本分支新增模块互不耦合）----
         if isinstance(images, list) and edit_params.get("use_sharpen_u", False):
-            LOGGER.warning("use_sharpen_u is a legacy unsharp-mask baseline, disabled by default for a reason.")
+            sharpened_images = []
             percent = int(edit_params.get("sharpen_gamma", 0.5) * 100)
             if percent > 0:
-                images = [
-                    img.filter(ImageFilter.UnsharpMask(radius=2.0, percent=percent, threshold=3))
-                    for img in images
-                ]
+                for img in images:
+                    sharpened = img.filter(ImageFilter.UnsharpMask(
+                        radius=2.0,
+                        percent=percent,
+                        threshold=3
+                    ))
+                    sharpened_images.append(sharpened)
+                images = sharpened_images
         # =======================================================
         return ChordEditPipelineOutput(
             images=images,
