@@ -258,6 +258,13 @@ The final composite mixes the two branches:
   I_{out} = M\odot I_{final} + (1-M)\odot I_{UM}.
   \label{eq:compose}
 \end{equation}
+Equation~\eqref{eq:compose} is written for the general case. In our reference
+implementation the localization block already anchors the background in pixel
+space, so VRR is disabled ($I_{VRR}=I_{local}$) and $\gamma_{um}=0$; then
+$I_{UM}=I_{src}$ and Eq.~\eqref{eq:compose} reduces to a hard copy of the source
+on the background, which is the configuration measured in
+Sec.~\ref{sec:exp}. Both switches are exposed for pipelines that anchor in the
+latent space only.
 
 \subsection{Compositing refinements}
 \label{sec:ece}
@@ -399,14 +406,14 @@ is slightly soft and the seam is visible along the shoulder contour; the
 contour-aligned composite removes the fringe; the probe restores stubble and fur
 strands; the unsharp baseline produces halos on the collar.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\linewidth]{figures/comparison.png}
+\includegraphics[width=0.92\linewidth]{figures/comparison.png}
 \caption{Qualitative comparison (best viewed zoomed). Columns: source,
 upstream, + near-binary mask, + contour and seam, + detail probe, unsharp
-baseline.}
+baseline. Rows: add beard, crown$\to$Christmas hat, horse$\to$unicorn.}
 \label{fig:comparison}
-\end{figure}
+\end{figure*}
 
 \begin{figure}[t]
 \centering
