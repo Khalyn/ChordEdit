@@ -1,5 +1,8 @@
 # Detail Completion and Contour-Aligned Compositing for One-Step Text-Guided Image Editing
 
+> **LaTeX 版本**：paper/overleaf/main.tex（CVPR 双栏，按团队 SHARP-Edit 的四模块结构重写，
+> 我们负责最右侧蓝色 High Frequency Completion 块）。本文件保留为中文审阅稿。
+
 > **Draft v0.1 — for internal review (not for submission yet).**
 > Paper draft in English (ready to be ported to LaTeX); review notes in Chinese at the end.
 > Numbers come from `scripts/eval_hfc.py --limit 8 --tag final3` on the 8 bundled examples.
