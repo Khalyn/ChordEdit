@@ -60,8 +60,9 @@ deliberately $\gamma$-lifted, so on a portrait example $57\%$ of the pixels are
 labelled background while only $16.5\%$ are truly unedited, and the ``background''
 keeps a $10$--$40\%$ contribution of the generated content. Second, once the
 composite is made near-binary the background can be restored to the source
-exactly, which lifts background PSNR from $50.0$\,dB to $56.8$\,dB without any
-filtering. Third, the remaining gap is in the \emph{edited} region, and it is
+exactly, which lifts background PSNR from $50.0$\,dB to $56.8$\,dB at that step
+alone (the complete stage settles at $56.6$\,dB) without any filtering. Third,
+the remaining gap is in the \emph{edited} region, and it is
 closed by a single latent-space detail probe: one extra UNet evaluation at a low
 noise level, whose high band \emph{replaces} rather than amplifies the current
 one, inside a spatial gate. Combined with a contour-aligned alpha and a
@@ -344,7 +345,8 @@ background, so the correction cannot move structure; it only removes the fringe.
 \State $g\gets \mathrm{clamp}((M-(\tau-w_{g}))/2w_{g},0,1)$ \Comment{gate}
 \State $s\gets 1$ \Comment{or Eq.~\eqref{eq:gain}}
 \State $I_{final}\gets g\odot(\LF(I_{local})+s\,\HF(I_{probe}))+(1-g)\odot I_{local}$
-\State $I_{out}\gets M\odot I_{final}+(1-M)\odot I_{VRR}$
+\State $I_{UM}\gets$ sharpen $I_{VRR}$ with $\gamma_{um}$ \Comment{default $\gamma_{um}=0$}
+\State $I_{out}\gets M\odot I_{final}+(1-M)\odot I_{UM}$
 \State $I_{out}\gets$ guided-$\alpha$ composite then seam compensation, Eqs.~\eqref{eq:guided}--\eqref{eq:seam}
 \end{algorithmic}
 \end{algorithm}
